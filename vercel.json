@@ -2,19 +2,15 @@
   "version": 2,
   "functions": {
     "api/reality.js": {
-      "runtime": "nodejs22.x",
       "maxDuration": 60
     },
     "api/reality-assets.js": {
-      "runtime": "nodejs22.x",
       "maxDuration": 60
     },
     "api/reality-realtime.js": {
-      "runtime": "nodejs22.x",
       "maxDuration": 30
     },
     "api/reality-admin.js": {
-      "runtime": "nodejs22.x",
       "maxDuration": 60
     }
   },
