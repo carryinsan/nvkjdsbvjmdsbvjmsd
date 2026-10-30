@@ -1,0 +1,1339 @@
+import pg from "pg";
+import { jwtVerify } from "jose";
+import { createHash, randomUUID } from "node:crypto";
+
+const __external = { "pg": { default: pg }, "jose": { jwtVerify: jwtVerify }, "node:crypto": { createHash: createHash, randomUUID: randomUUID } };
+const __modules = Object.create(null);
+
+// Module: src/server/config.js
+__modules["src/server/config.js"] = (() => {
+
+const DEFAULTS = {
+  maxRequestBytes: 256 * 1024,
+  maxEntitiesPerWorld: 5000,
+  maxCommandsPerRequest: 25,
+  rateLimitPerMinute: 120,
+  modelTimeoutMs: 30000
+};
+
+function getConfig() {
+  return {
+    databaseUrl: process.env.DATABASE_URL || '',
+    databaseSsl: process.env.DATABASE_SSL === 'true' || /sslmode=require/i.test(process.env.DATABASE_URL || ''),
+    authMode: process.env.AUTH_MODE || 'jwt',
+    jwtSecret: process.env.ARIXAI_JWT_SECRET || '',
+    jwtIssuer: process.env.ARIXAI_JWT_ISSUER || undefined,
+    jwtAudience: process.env.ARIXAI_JWT_AUDIENCE || undefined,
+    sessionCookie: process.env.ARIXAI_SESSION_COOKIE || 'arixai_session',
+    allowedOrigins: (process.env.ALLOWED_ORIGINS || '').split(',').map((v) => v.trim()).filter(Boolean),
+    modelUrl: process.env.ARIXAI_MODEL_API_URL || '',
+    modelKey: process.env.ARIXAI_MODEL_API_KEY || '',
+    modelId: process.env.ARIXAI_MODEL_ID || '',
+    modelTimeoutMs: positiveInt(process.env.ARIXAI_MODEL_TIMEOUT_MS, DEFAULTS.modelTimeoutMs),
+    maxRequestBytes: positiveInt(process.env.MAX_REQUEST_BYTES, DEFAULTS.maxRequestBytes),
+    maxEntitiesPerWorld: positiveInt(process.env.MAX_ENTITIES_PER_WORLD, DEFAULTS.maxEntitiesPerWorld),
+    maxCommandsPerRequest: positiveInt(process.env.MAX_COMMANDS_PER_REQUEST, DEFAULTS.maxCommandsPerRequest),
+    rateLimitPerMinute: positiveInt(process.env.RATE_LIMIT_PER_MINUTE, DEFAULTS.rateLimitPerMinute),
+    s3Endpoint: process.env.S3_ENDPOINT || '',
+    s3Region: process.env.S3_REGION || 'auto',
+    s3Bucket: process.env.S3_BUCKET || '',
+    s3AccessKeyId: process.env.S3_ACCESS_KEY_ID || '',
+    s3SecretAccessKey: process.env.S3_SECRET_ACCESS_KEY || '',
+    s3PublicBaseUrl: process.env.S3_PUBLIC_BASE_URL || '',
+    s3ForcePathStyle: process.env.S3_FORCE_PATH_STYLE === 'true',
+    workspaceAgentUrl: process.env.ARIXAI_WORKSPACE_AGENT_URL || '',
+    workspaceAgentToken: process.env.ARIXAI_WORKSPACE_AGENT_TOKEN || ''
+  };
+}
+
+function positiveInt(value, fallback) {
+  const parsed = Number.parseInt(value || '', 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+return { getConfig };
+})();
+
+
+// Module: src/server/db.js
+__modules["src/server/db.js"] = (() => {
+const pg = __external["pg"].default;
+const getConfig = __modules["src/server/config.js"]["getConfig"];
+
+
+const { Pool } = pg;
+let pool;
+
+function getPool() {
+  const config = getConfig();
+  if (!config.databaseUrl) throw new Error('DATABASE_URL is not configured. Persistent Reality Engine operations are disabled.');
+  if (!pool) {
+    pool = new Pool({
+      connectionString: config.databaseUrl,
+      ssl: config.databaseSsl ? { rejectUnauthorized: true } : undefined,
+      max: Math.min(10, Math.max(1, Number(process.env.PG_POOL_MAX || 3))),
+      idleTimeoutMillis: 10000,
+      connectionTimeoutMillis: 5000,
+      statement_timeout: 15000,
+      application_name: 'arixai-reality-engine'
+    });
+    pool.on('error', (error) => console.error('[reality-db] idle client error', error.message));
+  }
+  return pool;
+}
+
+async function withTransaction(callback) {
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const result = await callback(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch { /* connection may already be gone */ }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+return { getPool, withTransaction };
+})();
+
+
+// Module: src/server/auth.js
+__modules["src/server/auth.js"] = (() => {
+const jwtVerify = __external["jose"]["jwtVerify"];
+const getConfig = __modules["src/server/config.js"]["getConfig"];
+
+
+async function authenticateRequest(request) {
+  const config = getConfig();
+  if (config.authMode === 'development') {
+    if (process.env.NODE_ENV === 'production' || process.env.VERCEL === '1') throw httpError(500, 'DEV_AUTH_DISABLED', 'Development authentication is not permitted in production.');
+    return { id: 'local-developer', roles: ['developer'], authMode: 'development' };
+  }
+  if (config.authMode !== 'jwt') throw httpError(500, 'AUTH_MODE_INVALID', 'AUTH_MODE must be jwt or development.');
+  if (!config.jwtSecret || config.jwtSecret.length < 32 || !config.jwtIssuer || !config.jwtAudience) throw httpError(503, 'AUTH_NOT_CONFIGURED', 'Production JWT mode requires ARIXAI_JWT_SECRET (32+ characters), ARIXAI_JWT_ISSUER and ARIXAI_JWT_AUDIENCE.');
+  const token = extractToken(request, config.sessionCookie);
+  if (!token) throw httpError(401, 'AUTH_REQUIRED', 'Sign in to ArixAI to use Reality Engine.');
+  try {
+    const options = { algorithms: ['HS256'], issuer: config.jwtIssuer, audience: config.jwtAudience };
+    const { payload } = await jwtVerify(token, new TextEncoder().encode(config.jwtSecret), options);
+    if (typeof payload.sub !== 'string' || !payload.sub.trim() || payload.sub.length > 200) throw new Error('Invalid subject');
+    return { id: payload.sub, roles: Array.isArray(payload.roles) ? payload.roles : [], authMode: 'jwt' };
+  } catch {
+    throw httpError(401, 'AUTH_INVALID', 'The ArixAI session is invalid or expired.');
+  }
+}
+
+async function authenticateWebSocketToken(token, { worldId, branchId } = {}) {
+  const secret = process.env.REALITY_WS_TOKEN_SECRET || process.env.ARIXAI_JWT_SECRET || '';
+  if (secret.length < 32) throw httpError(503, 'WS_AUTH_NOT_CONFIGURED', 'WebSocket token signing is not configured.');
+  try {
+    const { payload } = await jwtVerify(token, new TextEncoder().encode(secret), { algorithms: ['HS256'], audience: 'arixai-reality-ws' });
+    if (typeof payload.sub !== 'string' || (worldId && payload.worldId !== worldId) || (branchId && payload.branchId !== branchId)) throw new Error('Invalid token scope');
+    return { id: payload.sub, worldId: payload.worldId, branchId: payload.branchId };
+  } catch {
+    throw httpError(401, 'WS_TOKEN_INVALID', 'The realtime access token is invalid or expired.');
+  }
+}
+
+async function createWebSocketToken(user, worldId, branchId) {
+  const { SignJWT } = await import('jose');
+  const secret = process.env.REALITY_WS_TOKEN_SECRET || process.env.ARIXAI_JWT_SECRET || '';
+  if (secret.length < 32) throw httpError(503, 'WS_AUTH_NOT_CONFIGURED', 'WebSocket token signing is not configured.');
+  return new SignJWT({ worldId, branchId })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setSubject(user.id)
+    .setAudience('arixai-reality-ws')
+    .setIssuedAt()
+    .setExpirationTime('60s')
+    .setJti(crypto.randomUUID())
+    .sign(new TextEncoder().encode(secret));
+}
+
+function extractToken(request, cookieName) {
+  const auth = request.headers?.authorization || request.headers?.Authorization;
+  if (typeof auth === 'string' && auth.startsWith('Bearer ')) return auth.slice(7).trim();
+  const cookie = request.headers?.cookie || '';
+  for (const part of cookie.split(';')) {
+    const [name, ...value] = part.trim().split('=');
+    if (name === cookieName) return decodeURIComponent(value.join('='));
+  }
+  return null;
+}
+
+function httpError(status, code, message) {
+  const error = new Error(message);
+  error.status = status;
+  error.code = code;
+  return error;
+}
+
+return { authenticateRequest, authenticateWebSocketToken, createWebSocketToken, httpError };
+})();
+
+
+// Module: src/server/response.js
+__modules["src/server/response.js"] = (() => {
+
+function sendJson(res, status, payload, extraHeaders = {}) {
+  res.statusCode = status;
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  for (const [key, value] of Object.entries(extraHeaders)) res.setHeader(key, value);
+  res.end(JSON.stringify(payload));
+}
+
+function getRequestBody(req, maxBytes) {
+  if (req.body && typeof req.body === 'object') return req.body;
+  return new Promise((resolve, reject) => {
+    let data = '';
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        reject(Object.assign(new Error(`Request body exceeds ${maxBytes} bytes.`), { status: 413, code: 'BODY_TOO_LARGE' }));
+        req.destroy();
+        return;
+      }
+      data += chunk.toString('utf8');
+    });
+    req.on('end', () => {
+      if (!data) return resolve({});
+      try { resolve(JSON.parse(data)); }
+      catch { reject(Object.assign(new Error('Request body must be valid JSON.'), { status: 400, code: 'INVALID_JSON' })); }
+    });
+    req.on('error', reject);
+  });
+}
+
+function assertSameOrigin(req, allowedOrigins) {
+  const origin = req.headers?.origin;
+  if (!origin) return;
+  if (!allowedOrigins.length || !allowedOrigins.includes(origin)) {
+    throw Object.assign(new Error('Origin is not allowed.'), { status: 403, code: 'ORIGIN_NOT_ALLOWED' });
+  }
+}
+
+return { sendJson, getRequestBody, assertSameOrigin };
+})();
+
+
+// Module: src/server/rate-limit.js
+__modules["src/server/rate-limit.js"] = (() => {
+const getPool = __modules["src/server/db.js"]["getPool"];
+const getConfig = __modules["src/server/config.js"]["getConfig"];
+const httpError = __modules["src/server/auth.js"]["httpError"];
+
+
+async function enforceRateLimit(ownerId, operation) {
+  const limit = getConfig().rateLimitPerMinute;
+  const result = await getPool().query(
+    `INSERT INTO reality_rate_limits(owner_id, operation, window_start, request_count)
+     VALUES ($1, $2, date_trunc('minute', NOW()), 1)
+     ON CONFLICT(owner_id, operation, window_start)
+     DO UPDATE SET request_count = reality_rate_limits.request_count + 1
+     RETURNING request_count, window_start`,
+    [ownerId, operation]
+  );
+  const count = Number(result.rows[0].request_count);
+  if (count > limit) throw httpError(429, 'RATE_LIMITED', `Rate limit exceeded. Limit: ${limit} requests per minute.`);
+  return { remaining: Math.max(0, limit - count), resetAt: new Date(result.rows[0].window_start).getTime() + 60000 };
+}
+
+return { enforceRateLimit };
+})();
+
+
+// Module: src/shared/seeded-rng.js
+__modules["src/shared/seeded-rng.js"] = (() => {
+
+function createSeededRandom(seed = 1) {
+  let state = (Number(seed) >>> 0) || 1;
+  return function random() {
+    state += 0x6D2B79F5;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+return { createSeededRandom };
+})();
+
+
+// Module: src/shared/world-spec.js
+__modules["src/shared/world-spec.js"] = (() => {
+
+const WORLD_SCHEMA_VERSION = '1.0.0';
+const ENGINE_VERSION = '0.1.0';
+const MAX_ENTITY_COUNT = 5000;
+const ALLOWED_SHAPES = new Set(['box', 'sphere', 'cylinder', 'capsule', 'plane', 'asset']);
+
+function createEmptyWorld({ title = 'Untitled world', domain = 'spatial.general', seed = cryptoSeed() } = {}) {
+  return {
+    schemaVersion: WORLD_SCHEMA_VERSION,
+    worldId: null,
+    worldType: domain.startsWith('business.') ? 'system' : 'spatial',
+    domain,
+    title: cleanText(title, 120),
+    seed,
+    units: { length: 'meter', time: 'second', mass: 'kg' },
+    clock: { mode: 'fixed', stepMs: 1000 / 60, elapsedSeconds: 0 },
+    environment: { gravity: [0, -9.81, 0], background: '#edf1f8', grid: true },
+    entities: [],
+    relationships: [],
+    systems: [],
+    actors: [],
+    sources: [],
+    visualProfile: { quality: 'adaptive', shadows: true },
+    simulationProfile: { physicsEnabled: true, deterministic: true }
+  };
+}
+
+function validateWorldSpec(spec, { maxEntities = MAX_ENTITY_COUNT } = {}) {
+  const errors = [];
+  if (!isObject(spec)) errors.push('WorldSpec must be an object.');
+  if (errors.length) return { valid: false, errors };
+  if (spec.schemaVersion !== WORLD_SCHEMA_VERSION) errors.push(`Unsupported schemaVersion. Expected ${WORLD_SCHEMA_VERSION}.`);
+  if (typeof spec.title !== 'string' || !spec.title.trim() || spec.title.length > 120) errors.push('title must be a non-empty string up to 120 characters.');
+  if (typeof spec.domain !== 'string' || spec.domain.length > 100) errors.push('domain must be a string up to 100 characters.');
+  if (!Array.isArray(spec.entities) || spec.entities.length > maxEntities) errors.push(`entities must be an array with at most ${maxEntities} entries.`);
+  if (Array.isArray(spec.entities)) {
+    const ids = new Set();
+    for (const entity of spec.entities) {
+      if (!isObject(entity) || typeof entity.id !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(entity.id)) {
+        errors.push('Every entity must have a valid id.');
+        continue;
+      }
+      if (ids.has(entity.id)) errors.push(`Duplicate entity id: ${entity.id}`);
+      ids.add(entity.id);
+      if (!isObject(entity.components)) errors.push(`Entity ${entity.id} must have components.`);
+      const transform = entity.components?.transform;
+      if (transform) {
+        for (const key of ['position', 'rotation', 'scale']) {
+          if (transform[key] !== undefined && !validVector3(transform[key])) errors.push(`Entity ${entity.id} has an invalid transform.${key}.`);
+        }
+      }
+      const shape = entity.components?.renderable?.shape;
+      if (shape && !ALLOWED_SHAPES.has(shape)) errors.push(`Entity ${entity.id} uses unsupported shape ${shape}.`);
+      if (shape === 'asset' && (typeof entity.components?.renderable?.assetId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(entity.components.renderable.assetId))) errors.push(`Entity ${entity.id} requires a valid UUID renderable.assetId when shape is asset.`);
+      const physics = entity.components?.physics;
+      if (physics && (!['dynamic', 'fixed', 'kinematic'].includes(physics.bodyType || 'dynamic'))) errors.push(`Entity ${entity.id} has an invalid physics bodyType.`);
+    }
+  }
+  if (!Array.isArray(spec.relationships)) errors.push('relationships must be an array.');
+  if (!isObject(spec.environment)) errors.push('environment must be an object.');
+  if (spec.environment?.gravity !== undefined && !validVector3(spec.environment.gravity)) errors.push('environment.gravity must be a finite 3-vector.');
+  return { valid: errors.length === 0, errors };
+}
+
+function normalizeEntity(entity) {
+  if (!isObject(entity)) throw new TypeError('Entity must be an object.');
+  const components = isObject(entity.components) ? entity.components : {};
+  const transform = components.transform || {};
+  const renderable = components.renderable || {};
+  const physics = components.physics || {};
+  const shape = ALLOWED_SHAPES.has(renderable.shape) ? renderable.shape : 'box';
+  return {
+    id: String(entity.id || cryptoId()),
+    type: cleanText(entity.type || shape, 64),
+    name: cleanText(entity.name || `${shape[0].toUpperCase()}${shape.slice(1)}`, 100),
+    components: {
+      transform: {
+        position: vector3(transform.position, [0, 1, 0]),
+        rotation: vector3(transform.rotation, [0, 0, 0]),
+        scale: vector3(transform.scale, [1, 1, 1])
+      },
+      renderable: {
+        shape,
+        color: validHex(renderable.color) ? renderable.color : '#8796bb',
+        roughness: finiteClamp(renderable.roughness, 0, 1, 0.65),
+        metalness: finiteClamp(renderable.metalness, 0, 1, 0.08),
+        ...(typeof renderable.assetId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(renderable.assetId) ? { assetId: renderable.assetId } : {})
+      },
+      physics: {
+        enabled: physics.enabled !== false,
+        bodyType: ['dynamic', 'fixed', 'kinematic'].includes(physics.bodyType) ? physics.bodyType : 'dynamic',
+        mass: finiteClamp(physics.mass, 0.01, 100000, 1),
+        restitution: finiteClamp(physics.restitution, 0, 1, 0.15),
+        friction: finiteClamp(physics.friction, 0, 2, 0.6)
+      }
+    }
+  };
+}
+
+function cleanText(value, max = 120) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function validVector3(value) {
+  return Array.isArray(value) && value.length === 3 && value.every((item) => Number.isFinite(item) && Math.abs(item) <= 1e7);
+}
+
+function vector3(value, fallback) {
+  return validVector3(value) ? value.map(Number) : [...fallback];
+}
+
+function finiteClamp(value, min, max, fallback) {
+  return Number.isFinite(Number(value)) ? Math.min(max, Math.max(min, Number(value))) : fallback;
+}
+
+function validHex(value) {
+  return typeof value === 'string' && /^#[0-9a-fA-F]{6}$/.test(value);
+}
+
+function cryptoId() {
+  return globalThis.crypto?.randomUUID?.() || `ent_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function cryptoSeed() {
+  const values = new Uint32Array(1);
+  globalThis.crypto?.getRandomValues?.(values);
+  return values[0] || Math.floor(Math.random() * 0xffffffff);
+}
+
+return { WORLD_SCHEMA_VERSION, ENGINE_VERSION, MAX_ENTITY_COUNT, createEmptyWorld, validateWorldSpec, normalizeEntity, cleanText, isObject, validVector3, vector3, finiteClamp, validHex, cryptoId };
+})();
+
+
+// Module: src/shared/world-commands.js
+__modules["src/shared/world-commands.js"] = (() => {
+const cleanText = __modules["src/shared/world-spec.js"]["cleanText"];
+const isObject = __modules["src/shared/world-spec.js"]["isObject"];
+const normalizeEntity = __modules["src/shared/world-spec.js"]["normalizeEntity"];
+const vector3 = __modules["src/shared/world-spec.js"]["vector3"];
+const validHex = __modules["src/shared/world-spec.js"]["validHex"];
+const validVector3 = __modules["src/shared/world-spec.js"]["validVector3"];
+
+
+const ALLOWED_COMMANDS = new Set([
+  'CREATE_ENTITY', 'REMOVE_ENTITY', 'ENTITY_TRANSFORM', 'SET_PROPERTY',
+  'ADD_RELATIONSHIP', 'REMOVE_RELATIONSHIP', 'SET_ENVIRONMENT'
+]);
+
+function validateWorldCommand(command) {
+  const errors = [];
+  if (!isObject(command) || !ALLOWED_COMMANDS.has(command.type)) return { valid: false, errors: ['Unsupported command type.'] };
+  if (command.type === 'CREATE_ENTITY') {
+    try {
+      const sourceShape = command.entity?.components?.renderable?.shape;
+      if (sourceShape && !['box', 'sphere', 'cylinder', 'capsule', 'plane', 'asset'].includes(sourceShape)) errors.push('Unsupported renderable shape.');
+      if (sourceShape === 'asset' && !validId(command.entity?.components?.renderable?.assetId)) errors.push('Asset entities require a valid assetId.');
+      if (command.entity?.id !== undefined && !validId(command.entity.id)) errors.push('Entity id must contain only letters, numbers, underscores or hyphens.');
+      normalizeEntity(command.entity);
+    } catch (error) { errors.push(error.message); }
+  }
+  if (command.type === 'REMOVE_ENTITY' && !validId(command.entityId)) errors.push('entityId is required.');
+  if (command.type === 'ENTITY_TRANSFORM') {
+    if (!validId(command.entityId)) errors.push('entityId is required.');
+    if (!isObject(command.changes)) errors.push('changes must be an object.');
+    for (const key of ['position', 'rotation', 'scale']) {
+      if (command.changes?.[key] !== undefined && !validVector3(command.changes[key])) errors.push(`${key} must be a finite 3-vector.`);
+    }
+  }
+  if (command.type === 'SET_PROPERTY') {
+    if (!validId(command.entityId)) errors.push('entityId is required.');
+    if (!['name', 'color', 'roughness', 'metalness', 'mass', 'restitution', 'friction', 'bodyType'].includes(command.property)) errors.push('Unsupported entity property.');
+    if (command.property === 'name' && (typeof command.value !== 'string' || command.value.trim().length > 100)) errors.push('name must be a string up to 100 characters.');
+    if (command.property === 'color' && !validHex(command.value)) errors.push('color must be a six-digit hex color.');
+    if (['roughness', 'metalness', 'mass', 'restitution', 'friction'].includes(command.property) && !Number.isFinite(command.value)) errors.push('Numeric property must be finite.');
+    if (['roughness', 'metalness', 'restitution'].includes(command.property) && Number.isFinite(command.value) && (command.value < 0 || command.value > 1)) errors.push(`${command.property} must be between 0 and 1.`);
+    if (command.property === 'mass' && Number.isFinite(command.value) && (command.value < 0.01 || command.value > 100000)) errors.push('mass must be between 0.01 and 100000.');
+    if (command.property === 'friction' && Number.isFinite(command.value) && (command.value < 0 || command.value > 2)) errors.push('friction must be between 0 and 2.');
+    if (command.property === 'bodyType' && !['dynamic', 'fixed', 'kinematic'].includes(command.value)) errors.push('Invalid bodyType.');
+  }
+  if (command.type === 'ADD_RELATIONSHIP') {
+    if (!validId(command.relationship?.id) || !validId(command.relationship?.from) || !validId(command.relationship?.to)) errors.push('Relationship id, from and to are required.');
+    if (command.relationship?.from === command.relationship?.to) errors.push('Self-referential relationships are not allowed.');
+  }
+  if (command.type === 'REMOVE_RELATIONSHIP' && !validId(command.relationshipId)) errors.push('relationshipId is required.');
+  if (command.type === 'SET_ENVIRONMENT') {
+    if (!isObject(command.changes) || Object.keys(command.changes).length < 1) errors.push('changes must be a non-empty object.');
+    const allowedEnvironmentKeys = new Set(['gravity', 'background', 'grid']);
+    for (const key of Object.keys(command.changes || {})) if (!allowedEnvironmentKeys.has(key)) errors.push(`Unsupported environment property: ${key}.`);
+    if (command.changes?.gravity !== undefined && !validVector3(command.changes.gravity)) errors.push('gravity must be a finite 3-vector.');
+    if (command.changes?.background !== undefined && !validHex(command.changes.background)) errors.push('background must be a hex color.');
+    if (command.changes?.grid !== undefined && typeof command.changes.grid !== 'boolean') errors.push('grid must be boolean.');
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+function applyWorldCommand(spec, command) {
+  const validation = validateWorldCommand(command);
+  if (!validation.valid) throw new Error(validation.errors.join(' '));
+  const next = structuredClone(spec);
+  switch (command.type) {
+    case 'CREATE_ENTITY': {
+      const entity = normalizeEntity(command.entity);
+      if (next.entities.some((item) => item.id === entity.id)) throw new Error(`Entity ${entity.id} already exists.`);
+      next.entities.push(entity);
+      return next;
+    }
+    case 'REMOVE_ENTITY': {
+      const before = next.entities.length;
+      next.entities = next.entities.filter((item) => item.id !== command.entityId);
+      if (next.entities.length === before) throw new Error('Entity not found.');
+      next.relationships = next.relationships.filter((item) => item.from !== command.entityId && item.to !== command.entityId);
+      return next;
+    }
+    case 'ENTITY_TRANSFORM': {
+      const entity = next.entities.find((item) => item.id === command.entityId);
+      if (!entity) throw new Error('Entity not found.');
+      for (const [key, value] of Object.entries(command.changes)) entity.components.transform[key] = vector3(value, entity.components.transform[key]);
+      return next;
+    }
+    case 'SET_PROPERTY': {
+      const entity = next.entities.find((item) => item.id === command.entityId);
+      if (!entity) throw new Error('Entity not found.');
+      const key = command.property;
+      if (key === 'name') entity.name = cleanText(command.value, 100);
+      else if (['color', 'roughness', 'metalness'].includes(key)) entity.components.renderable[key] = command.value;
+      else entity.components.physics[key] = command.value;
+      return next;
+    }
+    case 'ADD_RELATIONSHIP': {
+      if (!next.entities.some((item) => item.id === command.relationship.from) || !next.entities.some((item) => item.id === command.relationship.to)) throw new Error('Both relationship endpoints must exist.');
+      if (next.relationships.some((item) => item.id === command.relationship.id)) throw new Error('Relationship already exists.');
+      next.relationships.push({ id: command.relationship.id, from: command.relationship.from, to: command.relationship.to, type: cleanText(command.relationship.type || 'depends_on', 64) });
+      return next;
+    }
+    case 'REMOVE_RELATIONSHIP': {
+      next.relationships = next.relationships.filter((item) => item.id !== command.relationshipId);
+      return next;
+    }
+    case 'SET_ENVIRONMENT': {
+      next.environment = { ...next.environment, ...command.changes };
+      return next;
+    }
+    default: throw new Error('Unsupported command.');
+  }
+}
+
+function validateCommandBatch(commands, max = 25) {
+  if (!Array.isArray(commands) || commands.length < 1 || commands.length > max) throw new Error(`commands must contain 1–${max} operations.`);
+  for (const command of commands) {
+    const result = validateWorldCommand(command);
+    if (!result.valid) throw new Error(result.errors.join(' '));
+  }
+  return true;
+}
+
+function validId(value) { return typeof value === 'string' && /^[a-zA-Z0-9_-]{1,80}$/.test(value); }
+
+return { validateWorldCommand, applyWorldCommand, validateCommandBatch };
+})();
+
+
+// Module: src/shared/factory-simulation.js
+__modules["src/shared/factory-simulation.js"] = (() => {
+const createSeededRandom = __modules["src/shared/seeded-rng.js"]["createSeededRandom"];
+
+
+const REQUIRED_NUMBERS = [
+  'hours', 'demandUnits', 'inventoryUnits', 'materialPerUnit',
+  'sellingPricePerUnit', 'materialCostPerUnit', 'laborCostPerHour', 'laborHours'
+];
+
+function validateFactoryInput(input) {
+  const errors = [];
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return { valid: false, errors: ['Input must be an object.'] };
+  for (const key of REQUIRED_NUMBERS) {
+    if (!Number.isFinite(input[key]) || input[key] < 0) errors.push(`${key} must be a finite non-negative number.`);
+  }
+  if (!(input.hours > 0 && input.hours <= 8760)) errors.push('hours must be greater than 0 and at most 8760.');
+  if (!Array.isArray(input.machines) || input.machines.length < 1 || input.machines.length > 100) errors.push('machines must contain between 1 and 100 machines.');
+  if (Array.isArray(input.machines)) {
+    const machineIds = new Set();
+    input.machines.forEach((machine, index) => {
+    if (!machine || typeof machine.id !== 'string' || !machine.id.trim()) errors.push(`machines[${index}].id is required.`);
+    else if (machineIds.has(machine.id)) errors.push(`machines[${index}].id must be unique.`);
+    else machineIds.add(machine.id);
+    if (!Number.isFinite(machine.capacityPerHour) || machine.capacityPerHour < 0) errors.push(`machines[${index}].capacityPerHour must be non-negative.`);
+    if (!Number.isFinite(machine.efficiency) || machine.efficiency < 0 || machine.efficiency > 1) errors.push(`machines[${index}].efficiency must be between 0 and 1.`);
+    });
+  }
+  if (input.downtime !== undefined && !Array.isArray(input.downtime)) errors.push('downtime must be an array.');
+  if (Array.isArray(input.downtime)) input.downtime.forEach((event, index) => {
+    if (!event || typeof event.machineId !== 'string' || !Number.isFinite(event.startHour) || !Number.isFinite(event.durationHours) || event.startHour < 0 || event.durationHours < 0 || event.startHour > input.hours || event.startHour + event.durationHours > input.hours + 1e-9) errors.push(`downtime[${index}] must identify a valid interval within the simulation horizon.`);
+    else if (Array.isArray(input.machines) && !input.machines.some((machine) => machine.id === event.machineId)) errors.push(`downtime[${index}] references an unknown machine.`);
+  });
+  return { valid: errors.length === 0, errors };
+}
+
+function runFactorySimulation(input) {
+  const validation = validateFactoryInput(input);
+  if (!validation.valid) throw new Error(validation.errors.join(' '));
+  const { hours, demandUnits, inventoryUnits, materialPerUnit, sellingPricePerUnit, materialCostPerUnit, laborCostPerHour, laborHours } = input;
+  const stepHours = Number.isFinite(input.stepHours) ? Math.min(1, Math.max(0.05, input.stepHours)) : 0.25;
+  const steps = Math.ceil(hours / stepHours);
+  const rows = [];
+  let totalProduced = 0;
+  let totalMachineCapacity = 0;
+  let remainingDemand = demandUnits;
+  let remainingInventory = inventoryUnits;
+  const downtimes = input.downtime || [];
+
+  for (let index = 0; index < steps; index += 1) {
+    const startHour = index * stepHours;
+    const duration = Math.min(stepHours, hours - startHour);
+    let capacity = 0;
+    for (const machine of input.machines) {
+      const unavailable = downtimes.some((event) => event.machineId === machine.id && startHour < event.startHour + event.durationHours && startHour + duration > event.startHour);
+      if (!unavailable && machine.available !== false) capacity += machine.capacityPerHour * machine.efficiency * duration;
+    }
+    const materialCapacity = materialPerUnit > 0 ? remainingInventory / materialPerUnit : Number.POSITIVE_INFINITY;
+    const produced = Math.max(0, Math.min(capacity, materialCapacity, remainingDemand));
+    const consumed = produced * materialPerUnit;
+    totalProduced += produced;
+    totalMachineCapacity += capacity;
+    remainingDemand -= produced;
+    remainingInventory -= consumed;
+    rows.push({ hour: Number((startHour + duration).toFixed(4)), capacity: round(capacity), produced: round(produced), cumulativeProduced: round(totalProduced), remainingDemand: round(remainingDemand), remainingInventory: round(remainingInventory) });
+    if (remainingDemand <= 0 || remainingInventory <= 0) break;
+  }
+
+  const revenue = totalProduced * sellingPricePerUnit;
+  const materialCost = totalProduced * materialCostPerUnit;
+  const laborCost = laborCostPerHour * Math.min(laborHours, hours);
+  const contribution = revenue - materialCost - laborCost;
+  const unmetDemand = Math.max(0, demandUnits - totalProduced);
+  return {
+    engine: 'arixai-factory-discrete-capacity-v1',
+    method: 'Deterministic time-stepped capacity and material constraint model',
+    input: structuredClone(input),
+    outputs: {
+      producedUnits: round(totalProduced),
+      unmetDemandUnits: round(unmetDemand),
+      availableMachineCapacityUnits: round(totalMachineCapacity),
+      revenue: round(revenue),
+      materialCost: round(materialCost),
+      laborCost: round(laborCost),
+      contributionBeforeOverheads: round(contribution),
+      inventoryRemaining: round(remainingInventory),
+      materialConsumed: round(inventoryUnits - remainingInventory)
+    },
+    series: rows,
+    formulas: [
+      'Machine capacity per step = sum(capacityPerHour × efficiency × step duration) for machines not in downtime.',
+      'Produced units per step = min(machine capacity, remaining material capacity, remaining demand).',
+      'Revenue = produced units × selling price per unit.',
+      'Contribution before overheads = revenue − material cost − labor cost.'
+    ],
+    assumptions: [
+      'Machine capacities and efficiencies are constant within each time step.',
+      'A machine is treated as unavailable for any step that overlaps a downtime interval.',
+      'Demand is fulfilled in production order; no new demand arrives during the horizon.',
+      'Material and labor costs are linear; taxes, depreciation, financing, scrap, setup time and overheads are excluded unless modeled separately.',
+      'The result is a model output, not a guarantee or external forecast.'
+    ]
+  };
+}
+
+function runFactoryMonteCarlo({ input, runs = 500, seed = 1, variations = {} }) {
+  const inputCheck = validateFactoryInput(input);
+  if (!inputCheck.valid) throw new Error(inputCheck.errors.join(' '));
+  if (!Number.isSafeInteger(seed) || seed < 0 || seed > 0xffffffff) throw new Error('seed must be an integer from 0 to 4294967295.');
+  if (!Number.isInteger(runs) || runs < 10 || runs > 10000) throw new Error('runs must be an integer between 10 and 10000.');
+  const random = createSeededRandom(seed);
+  const results = [];
+  const demandRange = safeRange(variations.demandMultiplier, [1, 1], 'demandMultiplier');
+  const efficiencyRange = safeRange(variations.efficiencyMultiplier, [1, 1], 'efficiencyMultiplier');
+  const costRange = safeRange(variations.materialCostMultiplier, [1, 1], 'materialCostMultiplier');
+  for (const [name, range] of [['demandMultiplier', demandRange], ['efficiencyMultiplier', efficiencyRange], ['materialCostMultiplier', costRange]]) {
+    if (range[0] < 0 || range[1] > 5 || (name === 'efficiencyMultiplier' && range[1] > 1)) throw new Error(`${name} range is outside the supported bounds.`);
+  }
+  for (let run = 0; run < runs; run += 1) {
+    const randomized = structuredClone(input);
+    randomized.demandUnits *= sample(random, demandRange);
+    randomized.materialCostPerUnit *= sample(random, costRange);
+    randomized.machines = randomized.machines.map((machine) => ({ ...machine, efficiency: Math.max(0, Math.min(1, machine.efficiency * sample(random, efficiencyRange))) }));
+    const output = runFactorySimulation(randomized).outputs;
+    results.push(output.contributionBeforeOverheads);
+  }
+  const sorted = [...results].sort((a, b) => a - b);
+  const mean = results.reduce((sum, value) => sum + value, 0) / runs;
+  const variance = results.reduce((sum, value) => sum + ((value - mean) ** 2), 0) / runs;
+  return {
+    engine: 'arixai-factory-monte-carlo-v1', runs, seed,
+    metric: 'contributionBeforeOverheads',
+    distribution: {
+      mean: round(mean), standardDeviation: round(Math.sqrt(variance)),
+      p05: quantile(sorted, 0.05), p50: quantile(sorted, 0.5), p95: quantile(sorted, 0.95),
+      min: round(sorted[0]), max: round(sorted[sorted.length - 1])
+    },
+    variations: { demandMultiplier: demandRange, efficiencyMultiplier: efficiencyRange, materialCostMultiplier: costRange },
+    disclaimer: 'Probabilistic results are only as meaningful as the user-supplied input ranges and the chosen model. They are not calibrated forecasts.'
+  };
+}
+
+function safeRange(range, fallback, name) {
+  if (range === undefined) return fallback;
+  if (!Array.isArray(range) || range.length !== 2 || !range.every(Number.isFinite) || range[0] < 0 || range[1] < range[0]) throw new Error(`${name} must be an ordered pair of finite non-negative numbers.`);
+  return range;
+}
+function sample(random, [min, max]) { return min + random() * (max - min); }
+function quantile(sorted, q) { return round(sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * q))]); }
+function round(value) { return Number.isFinite(value) ? Number(value.toFixed(4)) : null; }
+
+return { validateFactoryInput, runFactorySimulation, runFactoryMonteCarlo };
+})();
+
+
+// Module: src/server/world-service.js
+__modules["src/server/world-service.js"] = (() => {
+const createHash = __external["node:crypto"]["createHash"];
+const randomUUID = __external["node:crypto"]["randomUUID"];
+const createEmptyWorld = __modules["src/shared/world-spec.js"]["createEmptyWorld"];
+const ENGINE_VERSION = __modules["src/shared/world-spec.js"]["ENGINE_VERSION"];
+const validateWorldSpec = __modules["src/shared/world-spec.js"]["validateWorldSpec"];
+const applyWorldCommand = __modules["src/shared/world-commands.js"]["applyWorldCommand"];
+const validateCommandBatch = __modules["src/shared/world-commands.js"]["validateCommandBatch"];
+const runFactoryMonteCarlo = __modules["src/shared/factory-simulation.js"]["runFactoryMonteCarlo"];
+const runFactorySimulation = __modules["src/shared/factory-simulation.js"]["runFactorySimulation"];
+const getPool = __modules["src/server/db.js"]["getPool"];
+const withTransaction = __modules["src/server/db.js"]["withTransaction"];
+const getConfig = __modules["src/server/config.js"]["getConfig"];
+const httpError = __modules["src/server/auth.js"]["httpError"];
+
+
+async function createWorld({ ownerId, title, domain }) {
+  const safeTitle = cleanRequired(title, 120, 'title');
+  const safeDomain = cleanRequired(domain || 'spatial.general', 100, 'domain');
+  const spec = createEmptyWorld({ title: safeTitle, domain: safeDomain });
+  const validation = validateWorldSpec(spec);
+  if (!validation.valid) throw httpError(400, 'WORLD_SPEC_INVALID', validation.errors.join(' '));
+  return withTransaction(async (client) => {
+    const world = await client.query(
+      'INSERT INTO reality_worlds(owner_id,title,domain,schema_version) VALUES($1,$2,$3,$4) RETURNING id, title, domain, created_at, updated_at',
+      [ownerId, safeTitle, safeDomain, spec.schemaVersion]
+    );
+    spec.worldId = world.rows[0].id;
+    const branch = await client.query(
+      'INSERT INTO reality_branches(world_id,owner_id,name,sequence,current_spec) VALUES($1,$2,$3,0,$4::jsonb) RETURNING id,name,sequence',
+      [spec.worldId, ownerId, 'Main', JSON.stringify(spec)]
+    );
+    const snapshot = await insertSnapshot(client, { worldId: spec.worldId, branchId: branch.rows[0].id, sequence: 0, spec, ownerId });
+    await client.query('UPDATE reality_branches SET base_snapshot_id=$1 WHERE id=$2', [snapshot.id, branch.rows[0].id]);
+    return { world: world.rows[0], branch: branch.rows[0], spec, snapshot };
+  });
+}
+
+async function listWorlds(ownerId) {
+  const result = await getPool().query(
+    `SELECT w.id,w.title,w.domain,w.created_at,w.updated_at,
+      COALESCE((SELECT COUNT(*) FROM reality_branches b WHERE b.world_id=w.id),0)::int AS branch_count,
+      COALESCE((SELECT MAX(b.sequence) FROM reality_branches b WHERE b.world_id=w.id),0)::bigint AS max_sequence
+     FROM reality_worlds w WHERE w.owner_id=$1 AND w.deleted_at IS NULL ORDER BY w.updated_at DESC LIMIT 100`,
+    [ownerId]
+  );
+  return result.rows;
+}
+
+async function loadWorld({ ownerId, worldId, branchId }) {
+  const worldResult = await getPool().query(
+    'SELECT id,title,domain,schema_version,created_at,updated_at FROM reality_worlds WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL',
+    [worldId, ownerId]
+  );
+  if (!worldResult.rowCount) throw httpError(404, 'WORLD_NOT_FOUND', 'World not found or access denied.');
+  const branches = await getPool().query(
+    'SELECT id,name,parent_branch_id,base_snapshot_id,sequence,created_at,updated_at FROM reality_branches WHERE world_id=$1 AND owner_id=$2 ORDER BY created_at',
+    [worldId, ownerId]
+  );
+  if (!branches.rowCount) throw httpError(404, 'BRANCH_NOT_FOUND', 'World has no accessible branches.');
+  const selected = branchId ? branches.rows.find((item) => item.id === branchId) : branches.rows[0];
+  if (!selected) throw httpError(404, 'BRANCH_NOT_FOUND', 'Requested branch not found or access denied.');
+  const current = await getPool().query(
+    'SELECT current_spec,sequence FROM reality_branches WHERE id=$1 AND world_id=$2 AND owner_id=$3',
+    [selected.id, worldId, ownerId]
+  );
+  return { world: worldResult.rows[0], branches: branches.rows, branch: { ...selected, sequence: Number(current.rows[0].sequence) }, spec: current.rows[0].current_spec };
+}
+
+async function applyCommands({ ownerId, worldId, branchId, baseVersion, commands, idempotencyKey }) {
+  const config = getConfig();
+  validateCommandBatch(commands, config.maxCommandsPerRequest);
+  if (!Number.isSafeInteger(baseVersion) || baseVersion < 0) throw httpError(400, 'BASE_VERSION_REQUIRED', 'baseVersion must be a non-negative integer.');
+  if (!validCommandId(idempotencyKey)) throw httpError(400, 'IDEMPOTENCY_KEY_REQUIRED', 'A valid idempotencyKey is required.');
+  return withTransaction(async (client) => {
+    const branchResult = await client.query(
+      `SELECT b.id,b.sequence,b.current_spec,b.world_id,w.owner_id
+       FROM reality_branches b JOIN reality_worlds w ON w.id=b.world_id
+       WHERE b.id=$1 AND b.world_id=$2 AND b.owner_id=$3 AND w.deleted_at IS NULL FOR UPDATE OF b`,
+      [branchId, worldId, ownerId]
+    );
+    if (!branchResult.rowCount) throw httpError(404, 'BRANCH_NOT_FOUND', 'Branch not found or access denied.');
+    const branch = branchResult.rows[0];
+    const currentSequence = Number(branch.sequence);
+    if (currentSequence !== baseVersion) throw httpError(409, 'VERSION_CONFLICT', `World version changed. Current version is ${currentSequence}. Reload before retrying.`);
+    const existing = await client.query("SELECT id,sequence,event_type,payload FROM reality_events WHERE branch_id=$1 AND (command_id=$2 OR split_part(command_id, ':', 1)=$2) ORDER BY sequence", [branchId, idempotencyKey]);
+    if (existing.rowCount) return { duplicate: true, sequence: currentSequence, spec: branch.current_spec, events: existing.rows };
+    let spec = branch.current_spec;
+    const events = [];
+    let sequence = currentSequence;
+    for (let index = 0; index < commands.length; index += 1) {
+      spec = applyWorldCommand(spec, commands[index]);
+      const check = validateWorldSpec(spec, { maxEntities: config.maxEntitiesPerWorld });
+      if (!check.valid) throw httpError(400, 'WORLD_SPEC_INVALID', check.errors.join(' '));
+      sequence += 1;
+      const commandId = commands.length === 1 ? idempotencyKey : `${idempotencyKey}:${index}`;
+      const event = await client.query(
+        `INSERT INTO reality_events(world_id,branch_id,sequence,actor_id,event_type,payload,command_id)
+         VALUES($1,$2,$3,$4,$5,$6::jsonb,$7) RETURNING id,sequence,event_type,payload,created_at`,
+        [worldId, branchId, sequence, ownerId, commands[index].type, JSON.stringify(commands[index]), commandId]
+      );
+      events.push(event.rows[0]);
+    }
+    await assertAssetsOwned(client, ownerId, worldId, spec);
+    await client.query('UPDATE reality_branches SET current_spec=$1::jsonb,sequence=$2,updated_at=NOW() WHERE id=$3', [JSON.stringify(spec), sequence, branchId]);
+    await client.query('UPDATE reality_worlds SET updated_at=NOW() WHERE id=$1', [worldId]);
+    return { duplicate: false, sequence, spec, events };
+  });
+}
+
+async function saveSnapshot({ ownerId, worldId, branchId, baseVersion, spec }) {
+  const config = getConfig();
+  const validation = validateWorldSpec(spec, { maxEntities: config.maxEntitiesPerWorld });
+  if (!validation.valid) throw httpError(400, 'WORLD_SPEC_INVALID', validation.errors.join(' '));
+  if (spec.worldId !== worldId) throw httpError(400, 'WORLD_ID_MISMATCH', 'WorldSpec worldId does not match the target world.');
+  return withTransaction(async (client) => {
+    const branchResult = await client.query('SELECT b.id,b.sequence FROM reality_branches b JOIN reality_worlds w ON w.id=b.world_id WHERE b.id=$1 AND b.world_id=$2 AND b.owner_id=$3 AND w.deleted_at IS NULL FOR UPDATE OF b', [branchId, worldId, ownerId]);
+    if (!branchResult.rowCount) throw httpError(404, 'BRANCH_NOT_FOUND', 'Branch not found or access denied.');
+    const currentSequence = Number(branchResult.rows[0].sequence);
+    if (currentSequence !== baseVersion) throw httpError(409, 'VERSION_CONFLICT', `World version changed. Current version is ${currentSequence}.`);
+    await assertAssetsOwned(client, ownerId, worldId, spec);
+    const sequence = currentSequence + 1;
+    await client.query(
+      `INSERT INTO reality_events(world_id,branch_id,sequence,actor_id,event_type,payload,command_id)
+       VALUES($1,$2,$3,$4,'SNAPSHOT_SAVED',$5::jsonb,$6)`,
+      [worldId, branchId, sequence, ownerId, JSON.stringify({ entityCount: spec.entities.length }), randomUUID()]
+    );
+    await client.query('UPDATE reality_branches SET current_spec=$1::jsonb,sequence=$2,updated_at=NOW() WHERE id=$3', [JSON.stringify(spec), sequence, branchId]);
+    const snapshot = await insertSnapshot(client, { worldId, branchId, sequence, spec, ownerId });
+    await client.query('UPDATE reality_worlds SET updated_at=NOW() WHERE id=$1', [worldId]);
+    return { snapshot, sequence };
+  });
+}
+
+async function forkBranch({ ownerId, worldId, sourceBranchId, name }) {
+  const safeName = cleanRequired(name || 'Scenario branch', 100, 'name');
+  return withTransaction(async (client) => {
+    const source = await client.query('SELECT b.id,b.sequence,b.current_spec FROM reality_branches b JOIN reality_worlds w ON w.id=b.world_id WHERE b.id=$1 AND b.world_id=$2 AND b.owner_id=$3 AND w.deleted_at IS NULL FOR UPDATE OF b', [sourceBranchId, worldId, ownerId]);
+    if (!source.rowCount) throw httpError(404, 'BRANCH_NOT_FOUND', 'Source branch not found.');
+    const branch = await client.query(
+      'INSERT INTO reality_branches(world_id,owner_id,name,parent_branch_id,sequence,current_spec) VALUES($1,$2,$3,$4,0,$5::jsonb) RETURNING id,name,sequence,parent_branch_id',
+      [worldId, ownerId, safeName, sourceBranchId, JSON.stringify(source.rows[0].current_spec)]
+    );
+    const snapshot = await insertSnapshot(client, { worldId, branchId: branch.rows[0].id, sequence: 0, spec: source.rows[0].current_spec, ownerId });
+    await client.query('UPDATE reality_branches SET base_snapshot_id=$1 WHERE id=$2', [snapshot.id, branch.rows[0].id]);
+    return { branch: branch.rows[0], snapshot, sourceSequence: Number(source.rows[0].sequence) };
+  });
+}
+
+async function restoreSnapshotAsBranch({ ownerId, worldId, snapshotId, name }) {
+  const safeName = cleanRequired(name || 'Restored scenario', 100, 'name');
+  return withTransaction(async (client) => {
+    const source = await client.query(
+      `SELECT s.branch_id,s.sequence,s.spec FROM reality_snapshots s
+       JOIN reality_worlds w ON w.id=s.world_id
+       WHERE s.id=$1 AND s.world_id=$2 AND w.owner_id=$3 AND w.deleted_at IS NULL FOR SHARE OF s`,
+      [snapshotId, worldId, ownerId]
+    );
+    if (!source.rowCount) throw httpError(404, 'SNAPSHOT_NOT_FOUND', 'Snapshot not found or access denied.');
+    const spec = source.rows[0].spec;
+    const validation = validateWorldSpec(spec, { maxEntities: getConfig().maxEntitiesPerWorld });
+    if (!validation.valid) throw httpError(409, 'SNAPSHOT_INVALID', `Stored snapshot failed current validation: ${validation.errors.join(' ')}`);
+    const branchResult = await client.query(
+      `INSERT INTO reality_branches(world_id,owner_id,name,parent_branch_id,sequence,current_spec)
+       VALUES($1,$2,$3,$4,0,$5::jsonb) RETURNING id,name,sequence,parent_branch_id`,
+      [worldId, ownerId, safeName, source.rows[0].branch_id, JSON.stringify(spec)]
+    );
+    const branch = branchResult.rows[0];
+    const restored = await insertSnapshot(client, { worldId, branchId: branch.id, sequence: 0, spec, ownerId });
+    await client.query('UPDATE reality_branches SET base_snapshot_id=$1 WHERE id=$2', [restored.id, branch.id]);
+    return { branch, snapshot: restored, restoredFrom: { snapshotId, sourceSequence: Number(source.rows[0].sequence) } };
+  });
+}
+
+async function compareBranches({ ownerId, worldId, leftBranchId, rightBranchId }) {
+  if (!leftBranchId || !rightBranchId || leftBranchId === rightBranchId) throw httpError(400, 'BRANCH_COMPARISON_INVALID', 'Choose two different branches.');
+  const result = await getPool().query(
+    `SELECT b.id,b.name,b.sequence,b.current_spec FROM reality_branches b
+     JOIN reality_worlds w ON w.id=b.world_id
+     WHERE b.world_id=$1 AND b.owner_id=$2 AND b.id=ANY($3::uuid[]) AND w.deleted_at IS NULL`,
+    [worldId, ownerId, [leftBranchId, rightBranchId]]
+  );
+  if (result.rowCount !== 2) throw httpError(404, 'BRANCH_NOT_FOUND', 'Both branches must belong to this world and account.');
+  const left = result.rows.find((row) => row.id === leftBranchId);
+  const right = result.rows.find((row) => row.id === rightBranchId);
+  const leftEntities = new Map((left.current_spec.entities || []).map((entity) => [entity.id, entity]));
+  const rightEntities = new Map((right.current_spec.entities || []).map((entity) => [entity.id, entity]));
+  const added = [];
+  const removed = [];
+  const modified = [];
+  for (const [id, entity] of rightEntities) {
+    if (!leftEntities.has(id)) added.push({ id, name: entity.name, type: entity.type });
+    else if (stableStringify(leftEntities.get(id)) !== stableStringify(entity)) modified.push({ id, before: leftEntities.get(id), after: entity });
+  }
+  for (const [id, entity] of leftEntities) if (!rightEntities.has(id)) removed.push({ id, name: entity.name, type: entity.type });
+  const leftEnvironment = left.current_spec.environment || {};
+  const rightEnvironment = right.current_spec.environment || {};
+  const environmentChanged = stableStringify(leftEnvironment) !== stableStringify(rightEnvironment);
+  return {
+    left: { id: left.id, name: left.name, sequence: Number(left.sequence), entityCount: leftEntities.size },
+    right: { id: right.id, name: right.name, sequence: Number(right.sequence), entityCount: rightEntities.size },
+    diff: { added, removed, modified, environmentChanged },
+    note: 'Structural branch comparison only. It does not infer financial, physical or operational outcome differences.'
+  };
+}
+
+async function getEvents({ ownerId, worldId, branchId, afterSequence = 0, limit = 500 }) {
+  if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) throw httpError(400, 'INVALID_SEQUENCE', 'afterSequence must be non-negative.');
+  const boundedLimit = Math.min(500, Math.max(1, Number(limit) || 500));
+  const access = await getPool().query('SELECT sequence FROM reality_branches WHERE id=$1 AND world_id=$2 AND owner_id=$3', [branchId, worldId, ownerId]);
+  if (!access.rowCount) throw httpError(404, 'BRANCH_NOT_FOUND', 'Branch not found or access denied.');
+  const result = await getPool().query(
+    `SELECT id,sequence,actor_id,event_type,payload,created_at FROM reality_events
+     WHERE branch_id=$1 AND sequence>$2 ORDER BY sequence ASC LIMIT $3`,
+    [branchId, afterSequence, boundedLimit]
+  );
+  const currentSequence = Number(access.rows[0].sequence);
+  const lastSequence = result.rowCount ? Number(result.rows[result.rowCount - 1].sequence) : afterSequence;
+  return { events: result.rows, currentSequence, hasMore: lastSequence < currentSequence };
+}
+
+async function runFactoryScenario({ ownerId, worldId, input, monteCarlo }) {
+  await assertWorldAccess(ownerId, worldId);
+  if (monteCarlo) return runFactoryMonteCarlo(monteCarlo);
+  return runFactorySimulation(input);
+}
+
+async function createJob({ ownerId, worldId, jobType, input, output }) {
+  await assertWorldAccess(ownerId, worldId);
+  const result = await getPool().query(
+    `INSERT INTO reality_jobs(world_id,owner_id,job_type,input,output,status)
+     VALUES($1,$2,$3,$4::jsonb,$5::jsonb,'completed') RETURNING id,job_type,status,created_at`,
+    [worldId, ownerId, jobType, JSON.stringify(input), JSON.stringify(output ?? null)]
+  );
+  return result.rows[0];
+}
+
+async function getJob({ ownerId, jobId }) {
+  const result = await getPool().query('SELECT id,world_id,job_type,status,input,output,error_code,created_at,updated_at FROM reality_jobs WHERE id=$1 AND owner_id=$2', [jobId, ownerId]);
+  if (!result.rowCount) throw httpError(404, 'JOB_NOT_FOUND', 'Job not found.');
+  return result.rows[0];
+}
+
+async function deleteWorld({ ownerId, worldId }) {
+  const result = await getPool().query('UPDATE reality_worlds SET deleted_at=NOW() WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL RETURNING id', [worldId, ownerId]);
+  if (!result.rowCount) throw httpError(404, 'WORLD_NOT_FOUND', 'World not found.');
+  return { deleted: true, worldId };
+}
+
+async function assertWorldAccess(ownerId, worldId) {
+  const result = await getPool().query('SELECT id FROM reality_worlds WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL', [worldId, ownerId]);
+  if (!result.rowCount) throw httpError(404, 'WORLD_NOT_FOUND', 'World not found or access denied.');
+  return true;
+}
+
+
+async function assertAssetsOwned(client, ownerId, worldId, spec) {
+  const assetIds = [...new Set((spec.entities || [])
+    .filter((entity) => entity.components?.renderable?.shape === 'asset')
+    .map((entity) => entity.components.renderable.assetId))];
+  if (!assetIds.length) return;
+  const validIds = assetIds.filter((id) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id));
+  if (validIds.length !== assetIds.length) throw httpError(400, 'ASSET_REFERENCE_INVALID', 'World contains an invalid asset reference.');
+  const found = await client.query(
+    `SELECT id FROM reality_assets WHERE id = ANY($1::uuid[]) AND owner_id=$2 AND world_id=$3 AND status='verified'`,
+    [validIds, ownerId, worldId]
+  );
+  if (found.rowCount !== validIds.length) throw httpError(400, 'ASSET_REFERENCE_INVALID', 'Every referenced asset must be uploaded, verified and owned by this world.');
+}
+
+async function insertSnapshot(client, { worldId, branchId, sequence, spec, ownerId }) {
+  const serialized = stableStringify(spec);
+  const stateHash = createHash('sha256').update(serialized).digest('hex');
+  const result = await client.query(
+    `INSERT INTO reality_snapshots(world_id,branch_id,sequence,spec,state_hash,engine_version,created_by)
+     VALUES($1,$2,$3,$4::jsonb,$5,$6,$7) RETURNING id,sequence,state_hash,engine_version,created_at`,
+    [worldId, branchId, sequence, serialized, stateHash, ENGINE_VERSION, ownerId]
+  );
+  return result.rows[0];
+}
+
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
+function cleanRequired(value, max, label) {
+  if (typeof value !== 'string' || !value.trim() || value.length > max) throw httpError(400, 'INVALID_INPUT', `${label} must be a non-empty string up to ${max} characters.`);
+  return value.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function validCommandId(value) { return typeof value === 'string' && /^[a-zA-Z0-9_-]{8,100}$/.test(value); }
+
+return { createWorld, listWorlds, loadWorld, applyCommands, saveSnapshot, forkBranch, restoreSnapshotAsBranch, compareBranches, getEvents, runFactoryScenario, createJob, getJob, deleteWorld, assertWorldAccess };
+})();
+
+
+// Module: src/server/model-provider.js
+__modules["src/server/model-provider.js"] = (() => {
+const getConfig = __modules["src/server/config.js"]["getConfig"];
+const validateWorldCommand = __modules["src/shared/world-commands.js"]["validateWorldCommand"];
+
+
+async function compileWorldPrompt({ prompt, world, selectedEntityId = null }) {
+  const config = getConfig();
+  if (!config.modelUrl || !config.modelKey || !config.modelId) {
+    const error = new Error('The ArixAI model gateway is not configured. Set ARIXAI_MODEL_API_URL, ARIXAI_MODEL_API_KEY and ARIXAI_MODEL_ID on the server.');
+    error.status = 503;
+    error.code = 'MODEL_PROVIDER_NOT_CONFIGURED';
+    throw error;
+  }
+  const timeout = AbortSignal.timeout(config.modelTimeoutMs);
+  const system = [
+    'You are the ArixAI Reality Engine World Compiler.',
+    'Convert the user request into strictly structured world commands. Never output source code, scripts, HTML, SQL, shell commands, or executable expressions.',
+    'Return one JSON object only: {"title":"optional title","commands":[...],"explanation":"short plain-language summary"}.',
+    'Allowed commands: CREATE_ENTITY, REMOVE_ENTITY, ENTITY_TRANSFORM, SET_PROPERTY, ADD_RELATIONSHIP, REMOVE_RELATIONSHIP, SET_ENVIRONMENT.',
+    'CREATE_ENTITY shape: {"type":"CREATE_ENTITY","entity":{"id":"unique_safe_id","type":"box|sphere|cylinder|capsule|plane","name":"short name","components":{"transform":{"position":[x,y,z],"rotation":[x,y,z],"scale":[x,y,z]},"renderable":{"shape":"box|sphere|cylinder|capsule|plane","color":"#RRGGBB","roughness":0.65,"metalness":0.08},"physics":{"enabled":true,"bodyType":"dynamic|fixed|kinematic","mass":1,"restitution":0.15,"friction":0.6}}}}.',
+    'For entities not specified, do not invent financial or operational data. For physical objects, use sensible dimensions and positions to avoid overlaps where possible.',
+    'At most 25 commands. Keep IDs alphanumeric/underscore/hyphen and at most 80 characters.',
+    'Do not include unsupported fields or make claims that a simulation was run.'
+  ].join('\n');
+  const user = {
+    request: prompt,
+    currentWorld: {
+      title: world.title,
+      domain: world.domain,
+      entityCount: world.entities.length,
+      entities: world.entities.slice(0, 100).map((entity) => ({ id: entity.id, type: entity.type, name: entity.name, position: entity.components?.transform?.position }))
+    },
+    selectedEntityId
+  };
+  let response;
+  try {
+    response = await fetch(config.modelUrl, {
+      method: 'POST',
+      signal: timeout,
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.modelKey}` },
+      body: JSON.stringify({
+        model: config.modelId,
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+        messages: [{ role: 'system', content: system }, { role: 'user', content: JSON.stringify(user) }]
+      })
+    });
+  } catch (cause) {
+    const error = new Error(`ArixAI model gateway request failed: ${cause.message}`);
+    error.status = 502; error.code = 'MODEL_GATEWAY_UNREACHABLE'; throw error;
+  }
+  if (!response.ok) {
+    const error = new Error(`ArixAI model gateway returned HTTP ${response.status}.`);
+    error.status = 502; error.code = 'MODEL_GATEWAY_ERROR'; throw error;
+  }
+  const payload = await response.json();
+  const content = payload?.choices?.[0]?.message?.content;
+  if (typeof content !== 'string' || !content.trim()) throw modelOutputError('The model returned no structured content.');
+  let compiled;
+  try { compiled = JSON.parse(stripFences(content)); }
+  catch { throw modelOutputError('The model output was not valid JSON.'); }
+  if (!Array.isArray(compiled.commands) || compiled.commands.length < 1 || compiled.commands.length > 25) throw modelOutputError('The model must return between 1 and 25 commands.');
+  for (const command of compiled.commands) {
+    const result = validateWorldCommand(command);
+    if (!result.valid) throw modelOutputError(`The model generated an invalid command: ${result.errors.join(' ')}`);
+  }
+  return {
+    title: typeof compiled.title === 'string' ? compiled.title.slice(0, 120) : null,
+    commands: compiled.commands,
+    explanation: typeof compiled.explanation === 'string' ? compiled.explanation.slice(0, 600) : 'The requested world changes were compiled.'
+  };
+}
+
+function stripFences(value) { return value.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''); }
+function modelOutputError(message) { const error = new Error(message); error.status = 502; error.code = 'MODEL_OUTPUT_INVALID'; return error; }
+
+return { compileWorldPrompt };
+})();
+
+
+// Module: src/server/asset-provider.js
+__modules["src/server/asset-provider.js"] = (() => {
+const randomUUID = __external["node:crypto"]["randomUUID"];
+const createHash = __external["node:crypto"]["createHash"];
+const getConfig = __modules["src/server/config.js"]["getConfig"];
+const getPool = __modules["src/server/db.js"]["getPool"];
+const httpError = __modules["src/server/auth.js"]["httpError"];
+
+
+const ALLOWED_TYPES = new Set(['model/gltf-binary']);
+const MAX_ASSET_BYTES = 100 * 1024 * 1024;
+
+async function createAssetUpload({ ownerId, worldId, fileName, contentType, sizeBytes }) {
+  const config = getConfig();
+  assertStorageConfigured(config);
+  if (!ALLOWED_TYPES.has(contentType)) throw httpError(415, 'ASSET_TYPE_UNSUPPORTED', 'Unsupported asset content type.');
+  if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 1 || sizeBytes > MAX_ASSET_BYTES) throw httpError(413, 'ASSET_SIZE_INVALID', 'Asset must be between 1 byte and 100 MB.');
+  if (typeof worldId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(worldId)) throw httpError(400, 'WORLD_ID_INVALID', 'worldId must be a UUID.');
+  const world = await getPool().query('SELECT id FROM reality_worlds WHERE id=$1 AND owner_id=$2 AND deleted_at IS NULL', [worldId, ownerId]);
+  if (!world.rowCount) throw httpError(404, 'WORLD_NOT_FOUND', 'World not found or access denied.');
+  const safeName = String(fileName || 'asset.glb').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 160);
+  if (!safeName.toLowerCase().endsWith('.glb')) throw httpError(415, 'ASSET_EXTENSION_UNSUPPORTED', 'Only .glb files are enabled in this release.');
+  const ownerKey = createHash('sha256').update(ownerId).digest('hex').slice(0, 24);
+  const assetId = randomUUID();
+  const storageKey = `reality/${ownerKey}/${worldId}/${assetId}/${safeName}`;
+  const s3 = await loadS3(config);
+  const command = new s3.PutObjectCommand({ Bucket: config.s3Bucket, Key: storageKey, ContentType: contentType, ContentLength: sizeBytes });
+  const uploadUrl = await s3.getSignedUrl(s3.client, command, { expiresIn: 300 });
+  await getPool().query(
+    `INSERT INTO reality_assets(id, world_id, owner_id, storage_key, original_name, content_type, size_bytes, status)
+     SELECT $1, w.id, $2, $3, $4, $5, $6, 'pending' FROM reality_worlds w
+     WHERE w.id = $7 AND w.owner_id = $2 AND w.deleted_at IS NULL`,
+    [assetId, ownerId, storageKey, safeName, contentType, sizeBytes, worldId]
+  );
+  const check = await getPool().query('SELECT id FROM reality_assets WHERE id=$1 AND owner_id=$2', [assetId, ownerId]);
+  if (!check.rowCount) throw httpError(404, 'WORLD_NOT_FOUND', 'World not found or access denied.');
+  return { assetId, uploadUrl, method: 'PUT', headers: { 'Content-Type': contentType }, expiresInSeconds: 300 };
+}
+
+async function createAssetDownload({ ownerId, assetId }) {
+  const config = getConfig();
+  assertStorageConfigured(config);
+  const result = await getPool().query("SELECT storage_key,content_type,status FROM reality_assets WHERE id=$1 AND owner_id=$2", [assetId, ownerId]);
+  if (!result.rowCount || result.rows[0].status !== 'verified') throw httpError(404, 'ASSET_NOT_FOUND', 'Verified asset not found.');
+  const s3 = await loadS3(config);
+  const command = new s3.GetObjectCommand({ Bucket: config.s3Bucket, Key: result.rows[0].storage_key });
+  const downloadUrl = await s3.getSignedUrl(s3.client, command, { expiresIn: 300 });
+  return { assetId, downloadUrl, expiresInSeconds: 300, contentType: result.rows[0].content_type };
+}
+
+async function completeAssetUpload({ ownerId, assetId }) {
+  const config = getConfig();
+  assertStorageConfigured(config);
+  const row = await getPool().query('SELECT * FROM reality_assets WHERE id=$1 AND owner_id=$2', [assetId, ownerId]);
+  if (!row.rowCount) throw httpError(404, 'ASSET_NOT_FOUND', 'Asset not found.');
+  const s3 = await loadS3(config);
+  const head = await s3.client.send(new s3.HeadObjectCommand({ Bucket: config.s3Bucket, Key: row.rows[0].storage_key }));
+  if (Number(head.ContentLength) !== Number(row.rows[0].size_bytes) || head.ContentType !== row.rows[0].content_type) {
+    await getPool().query("UPDATE reality_assets SET status='rejected' WHERE id=$1", [assetId]);
+    throw httpError(400, 'ASSET_VERIFICATION_FAILED', 'Uploaded asset metadata does not match the upload request.');
+  }
+  const range = await s3.client.send(new s3.GetObjectCommand({ Bucket: config.s3Bucket, Key: row.rows[0].storage_key, Range: 'bytes=0-11' }));
+  const header = Buffer.from(await range.Body.transformToByteArray());
+  const isGlbV2 = header.length >= 12 && header.toString('ascii', 0, 4) === 'glTF' && header.readUInt32LE(4) === 2 && header.readUInt32LE(8) === Number(row.rows[0].size_bytes);
+  if (!isGlbV2) {
+    await getPool().query("UPDATE reality_assets SET status='rejected' WHERE id=$1", [assetId]);
+    throw httpError(400, 'ASSET_FORMAT_INVALID', 'The uploaded file is not a valid GLB 2.0 binary header.');
+  }
+  await getPool().query("UPDATE reality_assets SET status='verified' WHERE id=$1 AND owner_id=$2", [assetId, ownerId]);
+  const base = config.s3PublicBaseUrl.replace(/\/$/, '');
+  return { assetId, status: 'verified', url: base ? `${base}/${row.rows[0].storage_key}` : null };
+}
+
+async function loadS3(config) {
+  const [{ S3Client, PutObjectCommand, HeadObjectCommand, GetObjectCommand }, { getSignedUrl }] = await Promise.all([
+    import('@aws-sdk/client-s3'), import('@aws-sdk/s3-request-presigner')
+  ]);
+  const client = new S3Client({
+    region: config.s3Region,
+    endpoint: config.s3Endpoint || undefined,
+    forcePathStyle: config.s3ForcePathStyle || Boolean(config.s3Endpoint),
+    credentials: { accessKeyId: config.s3AccessKeyId, secretAccessKey: config.s3SecretAccessKey }
+  });
+  return { client, PutObjectCommand, HeadObjectCommand, GetObjectCommand, getSignedUrl };
+}
+function assertStorageConfigured(config) {
+  if (!config.s3Bucket || !config.s3AccessKeyId || !config.s3SecretAccessKey) throw httpError(503, 'ASSET_STORAGE_NOT_CONFIGURED', 'S3-compatible object storage is not configured.');
+}
+
+return { createAssetUpload, createAssetDownload, completeAssetUpload };
+})();
+
+// Core route bindings
+const authenticateRequest = __modules["src/server/auth.js"]["authenticateRequest"];
+const authenticateWebSocketToken = __modules["src/server/auth.js"]["authenticateWebSocketToken"];
+const httpError = __modules["src/server/auth.js"]["httpError"];
+const createWebSocketToken = __modules["src/server/auth.js"]["createWebSocketToken"];
+const getConfig = __modules["src/server/config.js"]["getConfig"];
+const sendJson = __modules["src/server/response.js"]["sendJson"];
+const getRequestBody = __modules["src/server/response.js"]["getRequestBody"];
+const assertSameOrigin = __modules["src/server/response.js"]["assertSameOrigin"];
+const enforceRateLimit = __modules["src/server/rate-limit.js"]["enforceRateLimit"];
+const createWorld = __modules["src/server/world-service.js"]["createWorld"];
+const listWorlds = __modules["src/server/world-service.js"]["listWorlds"];
+const loadWorld = __modules["src/server/world-service.js"]["loadWorld"];
+const applyCommands = __modules["src/server/world-service.js"]["applyCommands"];
+const saveSnapshot = __modules["src/server/world-service.js"]["saveSnapshot"];
+const forkBranch = __modules["src/server/world-service.js"]["forkBranch"];
+const restoreSnapshotAsBranch = __modules["src/server/world-service.js"]["restoreSnapshotAsBranch"];
+const compareBranches = __modules["src/server/world-service.js"]["compareBranches"];
+const getEvents = __modules["src/server/world-service.js"]["getEvents"];
+const runFactoryScenario = __modules["src/server/world-service.js"]["runFactoryScenario"];
+const createJob = __modules["src/server/world-service.js"]["createJob"];
+const getJob = __modules["src/server/world-service.js"]["getJob"];
+const deleteWorld = __modules["src/server/world-service.js"]["deleteWorld"];
+const assertWorldAccess = __modules["src/server/world-service.js"]["assertWorldAccess"];
+const compileWorldPrompt = __modules["src/server/model-provider.js"]["compileWorldPrompt"];
+const createAssetUpload = __modules["src/server/asset-provider.js"]["createAssetUpload"];
+const completeAssetUpload = __modules["src/server/asset-provider.js"]["completeAssetUpload"];
+const createAssetDownload = __modules["src/server/asset-provider.js"]["createAssetDownload"];
+const getPool = __modules["src/server/db.js"]["getPool"];
+
+
+export async function handler(req, res) {
+  try {
+    assertSameOrigin(req, getConfig().allowedOrigins);
+    if (req.method === 'GET' && new URL(req.url, 'https://reality.local').searchParams.get('action') === 'health') {
+      const config = getConfig();
+      const production = process.env.NODE_ENV === 'production' || process.env.VERCEL === '1';
+      const checks = {
+        database: config.databaseUrl ? 'unverified' : 'not_configured',
+        modelGateway: config.modelUrl && config.modelKey && config.modelId ? 'configured' : 'not_configured',
+        objectStorage: config.s3Bucket && config.s3AccessKeyId && config.s3SecretAccessKey ? 'configured' : 'not_configured',
+        auth: config.authMode === 'jwt' && config.jwtSecret.length >= 32 && config.jwtIssuer && config.jwtAudience
+          ? 'configured'
+          : (!production && config.authMode === 'development' ? 'development_only' : 'not_ready'),
+        allowedOrigins: config.allowedOrigins.length ? 'configured' : 'not_configured'
+      };
+      try {
+        await getPool().query('SELECT 1');
+        const migration = await getPool().query("SELECT 1 FROM reality_schema_migrations WHERE migration_id='001_initial.sql'");
+        checks.database = migration.rowCount ? 'ok' : 'migration_required';
+      } catch { checks.database = config.databaseUrl ? 'error' : 'not_configured'; }
+      const authReady = checks.auth === 'configured' || (!production && checks.auth === 'development_only');
+      const ready = checks.database === 'ok' && authReady && (!production || checks.allowedOrigins === 'configured');
+      return sendJson(res, ready ? 200 : 503, { ok: ready, service: 'arixai-reality-engine', checks, timestamp: new Date().toISOString() });
+    }
+    if (req.method === 'GET') {
+      const user = await authenticateRequest(req);
+      const url = new URL(req.url, 'https://reality.local');
+      const action = url.searchParams.get('action');
+      if (action === 'list_worlds') {
+        await enforceRateLimit(user.id, 'list_worlds');
+        return sendJson(res, 200, { success: true, worlds: await listWorlds(user.id) });
+      }
+      if (action === 'load_world') {
+        await enforceRateLimit(user.id, 'load_world');
+        const world = await loadWorld({ ownerId: user.id, worldId: url.searchParams.get('worldId'), branchId: url.searchParams.get('branchId') || undefined });
+        return sendJson(res, 200, { success: true, ...world });
+      }
+      if (action === 'sync') {
+        await enforceRateLimit(user.id, 'sync');
+        const worldId = url.searchParams.get('worldId');
+        const branchId = url.searchParams.get('branchId');
+        const data = await getEvents({ ownerId: user.id, worldId, branchId, afterSequence: Number(url.searchParams.get('afterSequence') || 0), limit: Number(url.searchParams.get('limit') || 500) });
+        const current = await loadWorld({ ownerId: user.id, worldId, branchId });
+        return sendJson(res, 200, { success: true, ...data, spec: current.spec });
+      }
+      if (action === 'get_job') {
+        const job = await getJob({ ownerId: user.id, jobId: url.searchParams.get('jobId') });
+        return sendJson(res, 200, { success: true, job });
+      }
+      return sendJson(res, 405, { success: false, code: 'METHOD_NOT_ALLOWED', error: 'Use POST for Reality Engine actions.' });
+    }
+    if (req.method !== 'POST') {
+      res.setHeader('Allow', 'GET, POST');
+      return sendJson(res, 405, { success: false, code: 'METHOD_NOT_ALLOWED', error: 'Method not allowed.' });
+    }
+
+    const user = await authenticateRequest(req);
+    const body = await getRequestBody(req, getConfig().maxRequestBytes);
+    const action = body.action;
+    if (typeof action !== 'string') throw httpError(400, 'ACTION_REQUIRED', 'An action is required.');
+    const rate = await enforceRateLimit(user.id, action);
+    const common = { ownerId: user.id, worldId: body.worldId };
+
+    switch (action) {
+      case 'create_world': {
+        const result = await createWorld({ ownerId: user.id, title: body.title, domain: body.domain });
+        return sendJson(res, 201, { success: true, ...result }, { 'X-RateLimit-Remaining': String(rate.remaining) });
+      }
+      case 'apply_command': {
+        const result = await applyCommands({ ...common, branchId: body.branchId, baseVersion: body.baseVersion, commands: [body.command], idempotencyKey: body.idempotencyKey });
+        return sendJson(res, 200, { success: true, ...result });
+      }
+      case 'apply_command_batch': {
+        const result = await applyCommands({ ...common, branchId: body.branchId, baseVersion: body.baseVersion, commands: body.commands, idempotencyKey: body.idempotencyKey });
+        return sendJson(res, 200, { success: true, ...result });
+      }
+      case 'compile_prompt': {
+        const current = await loadWorld({ ...common, branchId: body.branchId });
+        const compiled = await compileWorldPrompt({ prompt: requiredString(body.prompt, 4000, 'prompt'), world: current.spec, selectedEntityId: body.selectedEntityId || null });
+        const result = await applyCommands({ ...common, branchId: body.branchId, baseVersion: body.baseVersion, commands: compiled.commands, idempotencyKey: body.idempotencyKey });
+        return sendJson(res, 200, { success: true, ...result, explanation: compiled.explanation, compiledTitle: compiled.title });
+      }
+      case 'save_snapshot': {
+        const result = await saveSnapshot({ ...common, branchId: body.branchId, baseVersion: body.baseVersion, spec: body.spec });
+        return sendJson(res, 200, { success: true, ...result });
+      }
+      case 'fork_branch': {
+        const result = await forkBranch({ ...common, sourceBranchId: body.branchId, name: body.name });
+        return sendJson(res, 201, { success: true, ...result });
+      }
+      case 'restore_snapshot': {
+        const result = await restoreSnapshotAsBranch({ ...common, snapshotId: body.snapshotId, name: body.name });
+        return sendJson(res, 201, { success: true, ...result });
+      }
+      case 'compare_branches': {
+        const result = await compareBranches({ ...common, leftBranchId: body.leftBranchId, rightBranchId: body.rightBranchId });
+        return sendJson(res, 200, { success: true, ...result });
+      }
+      case 'run_factory_simulation': {
+        const result = await runFactoryScenario({ ...common, input: body.input });
+        const job = await createJob({ ...common, jobType: 'factory_deterministic', input: body.input, output: result });
+        return sendJson(res, 200, { success: true, result, job });
+      }
+      case 'run_factory_monte_carlo': {
+        const result = await runFactoryScenario({ ...common, monteCarlo: body });
+        const job = await createJob({ ...common, jobType: 'factory_monte_carlo', input: body, output: result });
+        return sendJson(res, 200, { success: true, result, job });
+      }
+      case 'create_asset_upload': {
+        const result = await createAssetUpload({ ownerId: user.id, worldId: body.worldId, fileName: body.fileName, contentType: body.contentType, sizeBytes: body.sizeBytes });
+        return sendJson(res, 201, { success: true, ...result });
+      }
+      case 'complete_asset_upload': {
+        const result = await completeAssetUpload({ ownerId: user.id, assetId: body.assetId });
+        return sendJson(res, 200, { success: true, ...result });
+      }
+      case 'create_asset_download': {
+        const result = await createAssetDownload({ ownerId: user.id, assetId: body.assetId });
+        return sendJson(res, 200, { success: true, ...result });
+      }
+      case 'delete_world': {
+        const result = await deleteWorld({ ...common });
+        return sendJson(res, 200, { success: true, ...result });
+      }
+      default:
+        throw httpError(400, 'UNKNOWN_ACTION', `Unknown action: ${action}`);
+    }
+  } catch (error) {
+    const status = Number.isInteger(error.status) ? error.status : 500;
+    if (status >= 500) console.error('[reality-api]', error.code || 'UNHANDLED', error.message);
+    return sendJson(res, status, {
+      success: false,
+      code: error.code || 'INTERNAL_ERROR',
+      error: status >= 500 ? 'An unexpected server error occurred.' : error.message
+    });
+  }
+}
+
+function requiredString(value, max, name) {
+  if (typeof value !== 'string' || !value.trim() || value.length > max) throw httpError(400, 'INVALID_INPUT', `${name} must be a non-empty string up to ${max} characters.`);
+  return value.trim();
+}
+
+
+
+export { getPool, getConfig };
+export default handler;
