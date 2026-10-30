@@ -1,0 +1,75 @@
+{
+  "version": 2,
+  "functions": {
+    "api/reality.js": {
+      "runtime": "nodejs22.x",
+      "maxDuration": 60
+    },
+    "api/reality-assets.js": {
+      "runtime": "nodejs22.x",
+      "maxDuration": 60
+    },
+    "api/reality-realtime.js": {
+      "runtime": "nodejs22.x",
+      "maxDuration": 30
+    },
+    "api/reality-admin.js": {
+      "runtime": "nodejs22.x",
+      "maxDuration": 60
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/reality",
+      "destination": "/reality.html"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        {
+          "key": "Access-Control-Allow-Origin",
+          "value": "https://lexis-ai-chatini.vercel.app"
+        },
+        {
+          "key": "Access-Control-Allow-Methods",
+          "value": "GET, POST, PUT, DELETE, PATCH, OPTIONS"
+        },
+        {
+          "key": "Access-Control-Allow-Headers",
+          "value": "X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Authorization"
+        },
+        {
+          "key": "Access-Control-Allow-Credentials",
+          "value": "true"
+        }
+      ]
+    },
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "Referrer-Policy",
+          "value": "strict-origin-when-cross-origin"
+        },
+        {
+          "key": "Permissions-Policy",
+          "value": "camera=(), microphone=(), geolocation=()"
+        },
+        {
+          "key": "Cross-Origin-Opener-Policy",
+          "value": "same-origin"
+        },
+        {
+          "key": "Content-Security-Policy",
+          "value": "default-src 'self'; base-uri 'self'; object-src 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; connect-src 'self' https: wss:; frame-ancestors 'self'; form-action 'self'"
+        }
+      ]
+    }
+  ]
+}
