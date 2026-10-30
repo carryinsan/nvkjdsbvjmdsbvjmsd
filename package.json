@@ -1,0 +1,18 @@
+{
+  "name": "arixai-reality-engine-compact",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "check": "node --check api/reality.js && node --check api/reality-assets.js && node --check api/reality-realtime.js && node --check api/reality-admin.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.900.0",
+    "@aws-sdk/s3-request-presigner": "^3.900.0",
+    "jose": "^6.2.13",
+    "pg": "^8.16.3"
+  }
+}
